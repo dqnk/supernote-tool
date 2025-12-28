@@ -258,6 +258,37 @@ class SvgConverter:
         string
             an SVG string
         """
+        return self._convert(page_number, visibility_overlay)
+
+    def convert_to_drawing(self, page_number, visibility_overlay=None):
+        """Returns ReportLab drawing of the given page.
+
+        Parameters
+        ----------
+        page_number : int
+            page number to convert
+
+        Returns
+        -------
+        reportlab.graphics.shapes.Drawing
+            a drawing object
+        """
+        svg_str = self._convert(page_number, visibility_overlay)
+        return svg2rlg(BytesIO(bytes(svg_str, 'ascii')))
+
+    def _convert(self, page_number, visibility_overlay=None):
+        """Returns SVG string of the given page.
+
+        Parameters
+        ----------
+        page_number : int
+            page number to convert
+
+        Returns
+        -------
+        string
+            an SVG string
+        """
         page = self.note.get_page(page_number)
         horizontal = page.get_orientation() == fileformat.Page.ORIENTATION_HORIZONTAL
         page_width, page_height = (self.note.get_width(), self.note.get_height())
@@ -346,31 +377,48 @@ class PdfConverter:
         """
         if vectorize:
             converter = SvgConverter(self.note, self.palette)
+            convert_func = converter.convert_to_drawing
             renderer_class = PdfConverter.SvgPageRenderer
         else:
             converter = ImageConverter(self.note, self.palette)
+            convert_func = converter.convert
             renderer_class = PdfConverter.ImgPageRenderer
-        imglist = self._create_image_list(converter, page_number, max_workers=max_workers)
+
         pdf_data = BytesIO()
-        self._create_pdf(pdf_data, imglist, renderer_class, enable_link, enable_keyword)
+        if page_number < 0:
+            total = self.note.get_total_pages()
+            page_numbers = range(total)
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                imglist = executor.map(convert_func, page_numbers)
+                self._create_pdf(pdf_data, imglist, renderer_class, enable_link, enable_keyword, page_numbers)
+        else:
+            page_numbers = [page_number]
+            img = convert_func(page_number)
+            self._create_pdf(pdf_data, [img], renderer_class, enable_link, enable_keyword, page_numbers)
         return pdf_data.getvalue()
 
-    def _create_image_list(self, converter, page_number, max_workers=None):
-        imglist = []
-        if page_number < 0:
-            # convert all pages
-            total = self.note.get_total_pages()
-            with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                imglist = list(executor.map(converter.convert, range(total)))
-        else:
-            img = converter.convert(page_number)
-            imglist.append(img)
-        return imglist
-
-    def _create_pdf(self, buf, imglist, renderer_class, enable_link, enable_keyword):
+    def _create_pdf(self, buf, imglist, renderer_class, enable_link, enable_keyword, page_numbers):
         c = canvas.Canvas(buf, pagesize=self.pagesize)
-        keywords = self.note.get_keywords()
-        for n, img in enumerate(imglist):
+
+        # index keywords and links for faster lookup
+        indexed_keywords = {}
+        if enable_keyword:
+            for k in self.note.get_keywords():
+                p = k.get_page_number()
+                if p not in indexed_keywords:
+                    indexed_keywords[p] = []
+                indexed_keywords[p].append(k)
+
+        indexed_links = {}
+        if enable_link:
+            for l in self.note.get_links():
+                p = l.get_page_number()
+                if p not in indexed_links:
+                    indexed_links[p] = []
+                indexed_links[p].append(l)
+
+        for i, img in enumerate(imglist):
+            n = page_numbers[i]
             page = self.note.get_page(n)
             pageid = page.get_pageid()
             horizontal = page.get_orientation() == fileformat.Page.ORIENTATION_HORIZONTAL
@@ -379,30 +427,25 @@ class PdfConverter:
             renderer = renderer_class(img, pagesize)
             renderer.draw(c)
             if enable_keyword:
-                found = []
-                for keyword in keywords:
-                    if keyword.get_page_number() == n:
-                        found.append(keyword)
-                for i in found:
+                found = indexed_keywords.get(n, [])
+                for keyword in found:
                     try:
                         c.bookmarkPage(pageid)
-                        scaled_rect = self._calc_link_rect(i.get_rect(), renderer.get_scale())
-                        c.textAnnotation(i.get_keyword(),scaled_rect)
+                        scaled_rect = self._calc_link_rect(keyword.get_rect(), renderer.get_scale())
+                        c.textAnnotation(keyword.get_keyword(), scaled_rect)
                     except:
                         continue
             if enable_link:
                 pageid = page.get_pageid()
                 if pageid is not None:
                     c.bookmarkPage(pageid)
-                    self._add_links(c, n, renderer.get_scale())
+                    self._add_links(c, n, renderer.get_scale(), indexed_links)
             c.showPage()
         c.save()
 
-    def _add_links(self, cvs, page_number, scale):
-        links = self.note.get_links()
+    def _add_links(self, cvs, page_number, scale, indexed_links):
+        links = indexed_links.get(page_number, [])
         for link in links:
-            if link.get_page_number() != page_number:
-                continue
             if link.get_inout() == fileformat.Link.DIRECTION_IN:
                 # ignore income link
                 continue
@@ -428,16 +471,21 @@ class PdfConverter:
         def __init__(self, svg, pagesize):
             self.svg = svg
             self.pagesize = pagesize
-            self.drawing = svg2rlg(BytesIO(bytes(svg, 'ascii')))
+            if isinstance(svg, str):
+                self.drawing = svg2rlg(BytesIO(bytes(svg, 'ascii')))
+            else:
+                self.drawing = svg
             (w, h) = pagesize
-            (self.scale_x, self.scale_y) = (w / self.drawing.width, h / self.drawing.height)
-            self.drawing.scale(self.scale_x, self.scale_y)
+            if self.drawing is not None:
+                (self.scale_x, self.scale_y) = (w / self.drawing.width, h / self.drawing.height)
+                self.drawing.scale(self.scale_x, self.scale_y)
 
         def get_scale(self):
             return (self.scale_x, self.scale_y)
 
         def draw(self, cvs):
-            renderPDF.draw(self.drawing, cvs, 0, 0)
+            if self.drawing is not None:
+                renderPDF.draw(self.drawing, cvs, 0, 0)
 
     class ImgPageRenderer:
         def __init__(self, img, pagesize):
